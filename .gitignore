@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Model checkpoints / data
+*.pt
+*.pth
+*.ckpt
+tiny_shakespeare.txt
+
+# OS / editor
+.DS_Store
+*.swp

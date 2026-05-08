@@ -79,7 +79,7 @@ def zeros_like(params: Iterable[torch.Tensor]) -> list:
 
 def add_inplace(dst_list, src_list, alpha=1.0):
     for d, s in zip(dst_list, src_list):
-        d.add(s, alpha=alpha)
+        d.add_(s, alpha=alpha)
         
 def sub_lists(a, b):
     return [x-y for (x, y) in zip(a, b)]
@@ -145,7 +145,7 @@ def run(args):
     set_seed(args.seed + rank)
     
     # === Dataset (+ train/val split) ===
-    use_tiny = True  # set False to fall back to your ToyCharDataset
+    use_tiny = args.dataset == "tinyshakespeare"
 
     if use_tiny:
         ds_full = TinyShakespeareDataset(ctx=args.ctx, path=getattr(args, "data_path", "tiny_shakespeare.txt"))
@@ -172,9 +172,6 @@ def run(args):
     else:
         model = TinyTokenMLP(vocab=vocab_size, hidden=args.hidden).to(device)   
         
-    # Inner optimizer (per DiLoCo spec: AdamW commonly used)
-    inner_opt = torch.optim.AdamW(model.parameters(), lr = args.inner_lr, betas=(0.9, 0.95), weight_decay = args.weight_decay)
-    
     # server params, buffers, and outer state (kept on all ranks; rank0 is authoritative)
     server_params = clone_like([p.data for p in model.parameters()])
     outer_state = OuterOptState(momentum=zeros_like(server_params))
