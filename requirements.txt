@@ -1,0 +1,6 @@
+# Core training
+torch>=2.2          # tested on 2.7.0; torch.distributed (gloo) + MPS/CPU
+numpy>=1.26
+
+# Plotting the experiment outputs (experiments/plot_results.py)
+matplotlib>=3.8

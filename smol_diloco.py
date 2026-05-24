@@ -1,5 +1,5 @@
 # smol_diloco.py
-import math, os, random,  argparse
+import math, os, random, json, time, argparse
 from dataclasses import dataclass
 from typing import Iterable, Tuple
 
@@ -51,8 +51,37 @@ def broadcast_(tensors, src=0):
 
 
 def set_seed(seed:int):
-    random.seed(seed); torch.manual_seed(seed); 
-    
+    random.seed(seed); torch.manual_seed(seed);
+
+
+# --------------------
+# Metric logging
+# --------------------
+
+class MetricLogger:
+    """Append per-round metrics to <log_dir>/metrics.jsonl and dump config.json.
+
+    Only rank 0 writes. A no-op when log_dir is empty so the training loop
+    stays unchanged for ad-hoc runs.
+    """
+    def __init__(self, log_dir: str, rank: int, config: dict):
+        self.enabled = bool(log_dir) and rank == 0
+        if not self.enabled:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        self.path = os.path.join(log_dir, "metrics.jsonl")
+        with open(os.path.join(log_dir, "config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+        # truncate any previous run in this dir
+        open(self.path, "w").close()
+
+    def log(self, record: dict):
+        if not self.enabled:
+            return
+        with open(self.path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+
 
   
 # ---------------------------
@@ -186,13 +215,39 @@ def run(args):
         broadcast_(tensors, src=0)
         load_params_(server_params, tensors)
     load_params_(model.parameters(), server_params)
-    
-    # Training 
+
+    # === Metric logging setup ===
+    n_params = sum(p.numel() for p in model.parameters())
+    # Bytes moved across the network per sync round. Each round every worker
+    # contributes its delta to an all-reduce and receives the averaged result;
+    # a ring/recursive all-reduce moves ~2*(W-1)/W * payload per worker. We then
+    # broadcast the updated server params (~1 payload). fp32 => 4 bytes/param.
+    payload = n_params * 4
+    bytes_per_round = (2.0 * (world_size - 1) / max(1, world_size) + 1.0) * payload if world_size > 1 else 0.0
+    logger = MetricLogger(args.log_dir, rank, {
+        **vars(args),
+        "world_size": world_size,
+        "n_params": n_params,
+        "vocab_size": vocab_size,
+        "bytes_per_round": bytes_per_round,
+    })
+    cum_inner_steps = 0
+    cum_comm_bytes = 0.0
+
+    # Inner optimizer. The DiLoCo paper resets it at every outer step (K~500, so
+    # the reset is amortized). For a sync-interval sweep that reaches small K,
+    # resetting AdamW each round would stop it ever accumulating second-moment
+    # estimates -- an optimizer artifact that confounds the communication study.
+    # So we persist it by default; --reset_inner_opt restores the paper's behavior.
+    inner_opt = torch.optim.AdamW(model.parameters(), lr=args.inner_lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+
+    # Training
     it = iter(loader)
     for round_idx in range(args.rounds):
-        # Reset inner optmizer state each round (common/simple choice)
-        inner_opt = torch.optim.AdamW(model.parameters(), lr = args.inner_lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
-        
+        round_t0 = time.time()
+        if args.reset_inner_opt:
+            inner_opt = torch.optim.AdamW(model.parameters(), lr=args.inner_lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+
         # Snapshot of starting server weights for delta computation 
         start_params = clone_like(server_params)
         
@@ -209,10 +264,12 @@ def run(args):
             inner_opt.zero_grad(set_to_none = True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            inner_opt.step()    
-            
+            inner_opt.step()
+            last_loss = loss.item()
+
             if step % max(1, args.log_every) == 0 and rank == 0:
-                print(f"[round {round_idx:03d} | step {step:03d}] loss={loss.item():.3f}", flush=True)
+                print(f"[round {round_idx:03d} | step {step:03d}] loss={last_loss:.3f}", flush=True)
+        cum_inner_steps += args.local_steps
               
         # save server norm BEFORE outer update
         if rank == 0:
@@ -227,11 +284,15 @@ def run(args):
         # Average deltas across workers
         all_reduce_mean_(local_delta)  # your helper; no-op single-process
 
+        cum_comm_bytes += bytes_per_round
+
         # global delta size (diagnostic)
+        delta_norm_val = None
         if rank == 0:
             with torch.no_grad():
                 delta_norm = torch.sqrt(sum((d.float()**2).sum() for d in local_delta))
-                print(f"[round {round_idx:03d}] avg_delta_norm={delta_norm.item():.3e}")
+                delta_norm_val = delta_norm.item()
+                print(f"[round {round_idx:03d}] avg_delta_norm={delta_norm_val:.3e}")
 
         # outer update
         if rank == 0:
@@ -246,15 +307,20 @@ def run(args):
         load_params_(model.parameters(), tensors)
 
         # server step size (AFTER update)
+        step_norm_val = None
         if rank == 0:
             with torch.no_grad():
                 step_norm = torch.sqrt(sum(((p.data - s).float()**2).sum()
                                         for p, s in zip(server_params, start_params)))
+                step_norm_val = step_norm.item()
                 print(f"[round {round_idx:03d}] server_norm_before={server_norm_before.item():.3e} "
-                    f"step_norm={step_norm.item():.3e}")
+                    f"step_norm={step_norm_val:.3e}")
 
 
-        # === Validation over entire val split (rank 0 only) + sample text ===
+        # === Validation (rank 0 only) + sample text ===
+        # --val_batches caps the eval cost so it doesn't dominate wall-clock and
+        # so timing is comparable across runs; 0 means iterate the full split.
+        val_loss = None
         if args.eval_every > 0 and (round_idx + 1) % args.eval_every == 0 and rank == 0:
             model.eval()
             total, count = 0.0, 0
@@ -262,15 +328,32 @@ def run(args):
                 for vb in val_loader:
                     total += loss_on_batch(model, vb, device).item()
                     count += 1
+                    if args.val_batches and count >= args.val_batches:
+                        break
             val_loss = total / max(1, count)
             print(f"[round {round_idx:03d}] val_loss={val_loss:.3f}", flush=True)
 
             # Optional: print a short sample (works when TinyShakespeareDataset is used)
-            if 'ds_full' in locals() and hasattr(ds_full, "itos"):
+            if args.sample and 'ds_full' in locals() and hasattr(ds_full, "itos"):
                 txt = sample_text(model, ds_full.itos, ctx=args.ctx, steps=200, temperature=1.0, top_k=50, device=device)
                 print("-" * 60)
                 print(txt)
                 print("-" * 60)
+
+        # === Persist this round's metrics ===
+        if rank == 0:
+            tokens_seen = cum_inner_steps * args.batch_size * args.ctx * max(1, world_size)
+            logger.log({
+                "round": round_idx,
+                "inner_steps": cum_inner_steps,
+                "tokens_seen": tokens_seen,
+                "wall_time_s": round(time.time() - round_t0, 4),
+                "train_loss": last_loss,
+                "val_loss": val_loss,
+                "avg_delta_norm": delta_norm_val,
+                "server_step_norm": step_norm_val,
+                "comm_bytes": cum_comm_bytes,
+            })
 
 
     # Save checkpoint from rank0
@@ -292,12 +375,16 @@ def main():
     ap.add_argument("--local_steps", type=int, default=50, help="K inner AdamW steps per round")
     ap.add_argument("--rounds", type=int, default=50, help="number of outer rounds")
     ap.add_argument("--inner_lr", type=float, default=1e-3)
+    ap.add_argument("--reset_inner_opt", action="store_true", help="reset inner AdamW state each round (DiLoCo paper behavior)")
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--outer_lr", type=float, default=0.1, help="server step size on averaged delta")
     ap.add_argument("--outer_momentum", type=float, default=0.9, help="Nesterov momentum coefficient")
     ap.add_argument("--eval_every", type=int, default=5)
+    ap.add_argument("--val_batches", type=int, default=0, help="cap eval to this many batches (0 = full val split)")
     ap.add_argument("--log_every", type=int, default=10)
+    ap.add_argument("--log_dir", type=str, default="", help="if set, write metrics.jsonl + config.json here")
+    ap.add_argument("--sample", action="store_true", help="print a text sample at each eval")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--ckpt", type=str, default="smol_diloco.pt")
     ap.add_argument("--dataset", type=str, default="tinyshakespeare", choices=["tinyshakespeare", "toy"])
