@@ -121,6 +121,15 @@ small outer LR; large `K` is robust to it.
 ![heatmap](experiments/figures/grid_heatmap.png)
 ![sensitivity](experiments/figures/sensitivity.png)
 
+The mechanism is visible directly in the quantity the outer LR multiplies — the
+averaged worker-delta norm. It grows ~40× across the sweep (≈0.3 at `K=1`, ≈5–12
+at `K=64`), because more local steps let workers drift further before being pulled
+back. A single fixed outer LR therefore can't suit every `K`: it is too hot for the
+many tiny deltas of frequent syncing and about right for the few large deltas of
+infrequent syncing.
+
+![delta norm](experiments/figures/delta_norm.png)
+
 **3. Tuned, the communication frontier is real.** Taking the best outer LR for each
 `K`, all intervals reach essentially the same loss (~2.4–2.58) — so you can push
 `K` from 1 to 64, cut communication volume **~64×**, and lose almost nothing. The
