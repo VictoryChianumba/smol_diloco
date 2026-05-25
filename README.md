@@ -97,6 +97,8 @@ bash experiments/run_sweep.sh        # naive sweep: K∈{1,4,16,64} @ outer_lr 0
 python experiments/plot_results.py   # convergence + delta-norm figures
 bash experiments/run_grid.sh         # grid: K∈{1,4,16,64} × outer_lr∈{0.1,0.3,0.7}
 python experiments/plot_grid.py      # heatmap, sensitivity, tuned frontier + table
+bash experiments/run_frontier.sh     # extended K∈{1..256} to find where it breaks
+python experiments/plot_frontier.py  # extended frontier + break detection
 ```
 
 ### What was observed
@@ -137,6 +139,23 @@ DiLoCo premise holds; it just isn't free of hyperparameter retuning.
 
 ![tuned frontier](experiments/figures/frontier_tuned.png)
 
+**4. Where the frontier breaks.** Pushing `K` further (a fixed outer LR of 0.1, a
+larger fixed budget so even `K=256` gets multiple rounds) finds the limit. Through
+`K=64` runs converge cleanly; at **`K=128` the run diverges** — validation loss
+bottoms at 2.40 then climbs back to 2.91 in the final rounds as the averaged delta
+*stops shrinking* (workers have each drifted by ~7 and averaging can no longer
+reconcile them). This is the break: too few syncs and the outer step is reconciling
+models that no longer agree.
+
+![extended convergence](experiments/figures/convergence_extended.png)
+![extended frontier](experiments/figures/frontier_extended.png)
+
+`K=256` is left **unjudged**: at this budget it gets only 3 rounds and is still in
+its initial descent, so its endpoint says nothing about stability. That is itself a
+real constraint — at a fixed compute budget, very large `K` starves the run of the
+sync rounds it needs, so the *useful* ceiling on the sync interval is bounded by
+total training length, not just by drift.
+
 ### Benchmark
 
 Best outer LR per sync interval (fixed compute budget, 4 workers):
@@ -152,6 +171,20 @@ Best outer LR per sync interval (fixed compute budget, 4 workers):
 
 Loss is flat across the column while communication drops ~64×. The full grid (incl.
 the unstable `outer_lr=0.7` corner) is in `experiments/grid/`.
+
+Extended sweep (`outer_lr=0.1`, larger fixed budget) locating the break:
+
+| Sync interval K | Rounds | Best val loss | Final val loss | Within-run rise | Comm (GB) |
+|---:|---:|---:|---:|---:|---:|
+| 1   | 768 | 2.436 | 2.436 | +0.000 | 3.293 |
+| 4   | 192 | 2.439 | 2.439 | +0.000 | 0.823 |
+| 16  | 48  | 2.172 | 2.172 | +0.000 | 0.206 |
+| 64  | 12  | 2.442 | 2.442 | +0.000 | 0.052 |
+| 128 | 6   | 2.401 | 2.906 | **+0.506** ⚠ | 0.026 |
+| 256 | 3   | 2.301 | 2.301 | +0.000 \* | 0.013 |
+
+⚠ diverges within the run (the break). \* under-resolved — only 3 rounds, endpoint
+unreliable.
 
 ---
 
@@ -203,8 +236,10 @@ This is a study tool, not a training framework. In particular:
 | `datasets.py` | Tiny Shakespeare + synthetic toy datasets |
 | `experiments/run_sweep.sh` | Naive sync-interval sweep (fixed outer LR) |
 | `experiments/run_grid.sh` | `K × outer_lr` grid sweep |
+| `experiments/run_frontier.sh` | Extended sweep (`K` up to 256) to find the break |
 | `experiments/plot_results.py` | Convergence + delta-norm figures from a sweep |
 | `experiments/plot_grid.py` | Heatmap, sensitivity, tuned frontier + table from the grid |
+| `experiments/plot_frontier.py` | Extended frontier + automatic break detection |
 
 ## References
 
