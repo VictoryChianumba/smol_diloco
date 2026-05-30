@@ -99,7 +99,12 @@ bash experiments/run_grid.sh         # grid: K∈{1,4,16,64} × outer_lr∈{0.1,
 python experiments/plot_grid.py      # heatmap, sensitivity, tuned frontier + table
 bash experiments/run_frontier.sh     # extended K∈{1..256} to find where it breaks
 python experiments/plot_frontier.py  # extended frontier + break detection
+SHARD=non_iid OUT=experiments/grid_noniid bash experiments/run_grid.sh  # speaker-partitioned grid
+python experiments/plot_compare.py   # IID vs non-IID side-by-side
 ```
+
+The grid sweep is **resumable**: each cell writes to its own dir, and re-running
+the script skips cells whose `metrics.jsonl` already has the expected line count.
 
 ### What was observed
 
@@ -156,6 +161,40 @@ real constraint — at a fixed compute budget, very large `K` starves the run of
 sync rounds it needs, so the *useful* ceiling on the sync interval is bounded by
 total training length, not just by drift.
 
+**5. Non-IID data inverts the picture.** Everything above assumes workers see
+i.i.d. data (round-robin sharding of one corpus). Real decentralized training
+doesn't have that luxury: workers see different distributions — different
+geographies, different domains, different shards. To probe this, the same grid is
+re-run with **speaker-partitioned Shakespeare**: all 892 speakers split across 4
+workers in descending token-count order, so each worker trains on a disjoint set
+of characters and the across-worker distribution is genuinely non-IID. Validation
+stays on a held-out region of the corpus that no worker trained on.
+
+![grid compare](experiments/figures/grid_compare.png)
+![frontier compare](experiments/figures/frontier_compare.png)
+
+Three things change, all in directions theory predicts:
+
+- **A flat ~0.5–0.8 loss penalty everywhere.** No corner of the grid escapes; the
+  averaged model is worse than its IID twin at every `(K, outer_lr)`.
+- **The IID sweet spot becomes the worst point.** `K=16` was the best interval
+  under IID; under non-IID it is the *worst*. The mechanism is clean — with more
+  local steps each worker memorizes its own speakers' style/vocabulary, and the
+  outer average then has to reconcile models that have effectively trained on
+  *different tasks*. Frequent syncing (`K=1`) is now best, because it doesn't
+  give workers time to drift toward their local distribution.
+- **The optimal outer LR shifts upward at `K=16`** (0.3 → 0.7). Non-IID rewards
+  a *larger* corrective outer step, presumably because it needs to push harder
+  against per-worker bias to recover global structure.
+
+The practical reading: the comms-savings story from the tuned IID frontier
+(64× reduction at flat loss) does **not** transfer for free to the decentralized
+setting DiLoCo actually targets. Either you keep `K` small (giving up most of the
+communication savings), retune outer LR per regime, or both — and even then you
+pay a non-trivial heterogeneity tax. This is consistent with current research on
+DiLoCo at scale (e.g. OpenDiLoCo), where data-heterogeneity is the headline
+open problem rather than the sync-interval choice.
+
 ### Benchmark
 
 Best outer LR per sync interval (fixed compute budget, 4 workers):
@@ -186,6 +225,19 @@ Extended sweep (`outer_lr=0.1`, larger fixed budget) locating the break:
 ⚠ diverges within the run (the break). \* under-resolved — only 3 rounds, endpoint
 unreliable.
 
+IID vs non-IID (same hyperparameters, speaker-partitioned data):
+
+| K | IID best lr | IID loss | non-IID best lr | non-IID loss | Δ |
+|---:|---:|---:|---:|---:|---:|
+| 1  | 0.1 | 2.579 | 0.1 | 3.073 | **+0.495** |
+| 4  | 0.1 | 2.549 | 0.1 | 3.117 | **+0.568** |
+| 16 | 0.3 | 2.408 | **0.7** | 3.170 | **+0.762** |
+| 64 | 0.1 | 2.444 | 0.1 | 3.090 | **+0.646** |
+
+The IID best-K (16) becomes the non-IID *worst-K*, and the optimal outer LR
+shifts upward at that interval. The "$64×$ comms savings for ~0" payoff of the
+IID frontier does not survive contact with non-IID data without retuning.
+
 ---
 
 ## Usage
@@ -205,7 +257,9 @@ TORCH_DEVICE=cpu torchrun --nproc_per_node=4 smol_diloco.py \
 
 Key flags: `--local_steps` (sync interval `K`), `--rounds` (outer rounds),
 `--outer_lr` / `--outer_momentum` (server optimizer), `--inner_lr`,
-`--reset_inner_opt`, `--val_batches`, `--log_dir`.
+`--reset_inner_opt`, `--val_batches`, `--log_dir`,
+`--shard {iid,non_iid}` (speaker-partitioned Shakespeare for genuine
+across-worker distribution shift).
 
 ---
 
@@ -222,8 +276,11 @@ This is a study tool, not a training framework. In particular:
   tradeoff is the takeaway.
 - **No straggler / fault handling**, no heterogeneous workers, no compression of
   the synchronized deltas (an obvious next lever on top of larger `K`).
-- **Data sharding is round-robin** over a single corpus, not truly siloed data
-  distributions.
+- **Non-IID is only one knob.** The `--shard non_iid` mode partitions Tiny
+  Shakespeare by speaker, which is enough to show the regime change, but real
+  decentralized data is more pathological than that (e.g. drifting distributions
+  over time, vastly different shard sizes). The conclusions here are
+  *directional*, not quantitative.
 
 ---
 
@@ -240,6 +297,7 @@ This is a study tool, not a training framework. In particular:
 | `experiments/plot_results.py` | Convergence + delta-norm figures from a sweep |
 | `experiments/plot_grid.py` | Heatmap, sensitivity, tuned frontier + table from the grid |
 | `experiments/plot_frontier.py` | Extended frontier + automatic break detection |
+| `experiments/plot_compare.py` | Side-by-side grid comparison (e.g. IID vs non-IID) |
 
 ## References
 

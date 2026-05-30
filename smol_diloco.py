@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
-from datasets import ToyCharDataset, TinyShakespeareDataset, SeqDataset
+from datasets import ToyCharDataset, TinyShakespeareDataset, SeqDataset, speaker_shard_ids
 from models import TinyTokenMLP, CausalSelfAttention, TinyTransformerLM, TransformerBlock
 # --------------------
 # Utilities 
@@ -179,19 +179,37 @@ def run(args):
     if use_tiny:
         ds_full = TinyShakespeareDataset(ctx=args.ctx, path=getattr(args, "data_path", "tiny_shakespeare.txt"))
         vocab_size = ds_full.vocab_size
-        N = len(ds_full.data)
-        split = int(0.95 * N)
-        train_ids = ds_full.data[:split]
-        val_ids   = ds_full.data[split:]
-        ds_train = SeqDataset(train_ids, ctx=args.ctx)
-        ds_val   = SeqDataset(val_ids,   ctx=args.ctx)
+
+        if args.shard == "non_iid":
+            # Split the raw text 95/5 first, then partition the train side by
+            # speaker so workers see disjoint characters. The val set is a
+            # held-out region of the corpus -- no worker trained on it.
+            text = ds_full.text
+            text_split = int(0.95 * len(text))
+            train_text, val_text = text[:text_split], text[text_split:]
+            per_rank = speaker_shard_ids(train_text, ds_full.stoi, world_size)
+            ds_train = SeqDataset(per_rank[rank], ctx=args.ctx)
+            val_ids = torch.tensor([ds_full.stoi[c] for c in val_text if c in ds_full.stoi], dtype=torch.long)
+            ds_val = SeqDataset(val_ids, ctx=args.ctx)
+        else:
+            N = len(ds_full.data)
+            split = int(0.95 * N)
+            train_ids = ds_full.data[:split]
+            val_ids   = ds_full.data[split:]
+            ds_train = SeqDataset(train_ids, ctx=args.ctx)
+            ds_val   = SeqDataset(val_ids,   ctx=args.ctx)
     else:
         ds_train = ToyCharDataset(length=args.tokens, ctx=args.ctx, vocab=args.vocab, seed=args.seed)
         ds_val   = ToyCharDataset(length=max(10_000, int(args.tokens*0.05)), ctx=args.ctx, vocab=args.vocab, seed=args.seed+1)
         vocab_size = args.vocab
 
-    # Training loader sharded across ranks; validation unsharded (rank 0 will iterate it)
-    loader = shard_dataloader(ds_train, rank, world_size, args.batch_size)
+    # Training loader: in non-IID mode every rank already holds its own dataset,
+    # so just iterate it; in IID mode shard a single dataset round-robin. Val is
+    # always unsharded and only rank 0 evaluates it.
+    if args.shard == "non_iid" and use_tiny:
+        loader = torch.utils.data.DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    else:
+        loader = shard_dataloader(ds_train, rank, world_size, args.batch_size)
     val_loader = torch.utils.data.DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, drop_last=True)
 
 
@@ -389,6 +407,8 @@ def main():
     ap.add_argument("--ckpt", type=str, default="smol_diloco.pt")
     ap.add_argument("--dataset", type=str, default="tinyshakespeare", choices=["tinyshakespeare", "toy"])
     ap.add_argument("--data_path", type=str, default="tiny_shakespeare.txt")
+    ap.add_argument("--shard", type=str, default="iid", choices=["iid", "non_iid"],
+                    help="iid: round-robin sharding of one corpus; non_iid: each worker sees a disjoint set of Shakespeare speakers")
     ap.add_argument("--model", type=str, default="transformer", choices=["transformer", "mlp"])
     ap.add_argument("--n_embd", type=int, default=256)
     ap.add_argument("--n_head", type=int, default=4)
